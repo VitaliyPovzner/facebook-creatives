@@ -3,14 +3,15 @@ package utils
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
+	"time"
 
 	"github.com/rs/zerolog/log"
 )
 
 func PaginateRequest(url string) ([]byte, error) {
-	var allData []map[string]interface{}
+	allData := make([]map[string]interface{}, 0, 1000)
+	startTime := time.Now()
 
 	for url != "" {
 		resp, err := http.Get(url)
@@ -18,24 +19,22 @@ func PaginateRequest(url string) ([]byte, error) {
 			log.Error().Err(err).Msg("Error making request to Facebook API")
 			return nil, err
 		}
-		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
 			return nil, fmt.Errorf("failed to fetch data: status code %d", resp.StatusCode)
 		}
 
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			log.Error().Err(err).Msg("Failed to read response body")
-			return nil, err
-		}
-
+		decoder := json.NewDecoder(resp.Body)
 		var result map[string]interface{}
-		if err := json.Unmarshal(body, &result); err != nil {
-			log.Error().Err(err).Msg("Failed to parse JSON response")
+		if err := decoder.Decode(&result); err != nil {
+			resp.Body.Close()
+			log.Error().Err(err).Msg("Failed to decode JSON response")
 			return nil, err
 		}
+		resp.Body.Close()
 
+		// Process the "data" items
 		if data, ok := result["data"].([]interface{}); ok {
 			for _, item := range data {
 				if itemMap, ok := item.(map[string]interface{}); ok {
@@ -44,6 +43,7 @@ func PaginateRequest(url string) ([]byte, error) {
 			}
 		}
 
+		// Update the URL for the next page, if available
 		if paging, exists := result["paging"].(map[string]interface{}); exists {
 			if next, exists := paging["next"].(string); exists {
 				url = next
@@ -60,5 +60,7 @@ func PaginateRequest(url string) ([]byte, error) {
 		return nil, err
 	}
 
+	duration := time.Since(startTime)
+	log.Printf("PaginateRequest completed, time taken: %v", duration)
 	return responseJSON, nil
 }

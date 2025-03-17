@@ -61,25 +61,66 @@ func (s *FacebookService) FetchCreativeData() {
 	defer ticker.Stop()
 
 	for {
-		log.Info().Msg("Fetching Ad Accounts...")
+		log.Info().Msg("Starting FetchCreativeData pipeline...")
 
-		accounts, err := s.GetAdAccounts()
-		if err != nil {
-			log.Error().Err(err).Msg("Failed to fetch ad accounts")
-		}
+		// Define pipeline channels
+		accountsChan := make(chan AdAccount)
+		insightsChan := make(chan []AdInsight)
+		done := make(chan struct{})
 
-		for _, account := range accounts {
-			log.Info().Msgf("Fetching Ad Insights for Account: %s (%s)", account.Name, account.ID)
-
-			insights, err := s.FetchAdInsights(account)
+		// Step 1: Fetch Ad Accounts asynchronously
+		go func() {
+			defer close(accountsChan)
+			accounts, err := s.GetAdAccounts()
 			if err != nil {
-				log.Error().Err(err).Msgf("Failed to fetch insights for account %s", account.Name)
-				continue
+				log.Error().Err(err).Msg("Failed to fetch ad accounts")
+				return
+			}
+			for _, account := range accounts {
+				accountsChan <- account
+			}
+		}()
+
+		// Step 2: Fetch Insights concurrently using multiple workers
+		numWorkers := 5 // Number of workers fetching insights in parallel
+		go func() {
+			defer close(insightsChan)
+			workerGroup := make(chan struct{}, numWorkers)
+
+			for account := range accountsChan {
+				workerGroup <- struct{}{} // Limit concurrency
+
+				go func(acc AdAccount) {
+					defer func() { <-workerGroup }() // Release worker slot
+					
+					log.Info().Msgf("Fetching Ad Insights for Account: %s (%s)", acc.Name, acc.ID)
+					insights, err := s.FetchAdInsights(acc)
+					if err != nil {
+						log.Error().Err(err).Msgf("Failed to fetch insights for account %s", acc.Name)
+						return
+					}
+					insightsChan <- insights
+				}(account)
 			}
 
-			log.Info().Msgf("Fetched %d insights for account %s", len(insights), account.Name)
-		}
+			// Wait for all workers to finish
+			for i := 0; i < numWorkers; i++ {
+				workerGroup <- struct{}{}
+			}
+		}()
 
+		// Step 3: Process fetched insights
+		go func() {
+			defer close(done)
+			for insights := range insightsChan {
+				log.Info().Msgf("Processing %d insights...", len(insights))
+				
+			}
+		}()
+
+		<-done
+
+		log.Info().Msg("FetchCreativeData pipeline completed.")
 		<-ticker.C
 	}
 }
@@ -183,7 +224,8 @@ func (s *FacebookService) fetchAdInsightsResults(jobID string) ([]AdInsight, err
 	url := fmt.Sprintf("https://graph.facebook.com/%s/%s/insights?access_token=%s",
 		s.APIVersion, jobID, s.AccessToken)
 
-	responseData, err := utils.PaginateRequest(url)
+		 responseData, err := utils.PaginateRequest(url)
+		// responseData, err := utils.PaginateRequestWorkerPool(url)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to fetch ad insights results")
 		return nil, err
