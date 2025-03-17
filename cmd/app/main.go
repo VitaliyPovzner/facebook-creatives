@@ -1,14 +1,16 @@
 package main
 
 import (
-	"github.com/gorilla/mux"
-	"github.com/joho/godotenv"
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
+	"facebook-creatives/internal/service"
 	"net/http"
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/gorilla/mux"
+	"github.com/joho/godotenv"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
 func main() {
@@ -27,7 +29,21 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
+	accessToken := os.Getenv("FB_ACCESS_TOKEN")
+	if accessToken == "" {
+		log.Fatal().Msg("FB_ACCESS_TOKEN is not set")
+	}
 
+	// Retrieve Facebook API version
+	apiVersion := os.Getenv("FB_API_VERSION")
+	if apiVersion == "" {
+		apiVersion = "v18.0"
+	}
+
+	// Initialize Facebook Service
+	facebookService := service.NewFacebookService(accessToken)
+	// Start fetching creatives in the background
+	go facebookService.FetchCreativeData()
 
 	// Initialize Router
 	router := mux.NewRouter()
