@@ -1,4 +1,4 @@
-module github.com/yourusername/facebook-creatives
+module facebook-creatives
 
 go 1.23.2
 

@@ -1,22 +1,23 @@
 package main
 
 import (
-	"net/http"
-	"os"
-	"time"
-
 	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"time"
 )
 
 func main() {
 	// Load environment variables
-	if err := godotenv.Load(); err != nil {
-		log.Warn().Msg("No .env file found, using defaults")
+	envPath := filepath.Join("../../", ".env")
+	err := godotenv.Load(envPath)
+	if err != nil {
+		log.Warn().Msg("No .env file found, using system environment variables")
 	}
-
 	// Configure Zerolog
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339})
@@ -26,6 +27,7 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
+
 
 	// Initialize Router
 	router := mux.NewRouter()
