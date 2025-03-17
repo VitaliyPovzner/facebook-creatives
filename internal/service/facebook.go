@@ -5,10 +5,11 @@ import (
 	"fmt"
 	"os"
 
+	"errors"
 	"facebook-creatives/internal/utils"
 	"github.com/rs/zerolog/log"
+	"sync"
 	"time"
-	"errors"
 )
 
 type FacebookService struct {
@@ -34,6 +35,74 @@ func NewFacebookService(accessToken string) *FacebookService {
 	}
 }
 
+func (s *FacebookService) runPipeline() error {
+	accountsChan, errChan := s.fetchAdAccounts()
+	insightsChan := s.fetchAdInsights(accountsChan)
+	doneChan := s.processInsights(insightsChan)
+
+	select {
+	case err := <-errChan:
+		return err
+	case <-doneChan:
+	}
+	return nil
+}
+
+func (s *FacebookService) processInsights(insightsChan <-chan []AdInsight) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for insights := range insightsChan {
+			log.Info().Msgf("Processing %d insights", len(insights))
+		}
+	}()
+	return done
+}
+
+func (s *FacebookService) fetchAdInsights(accountsChan <-chan AdAccount) <-chan []AdInsight {
+	out := make(chan []AdInsight)
+	numWorkers := 5
+	workerGroup := make(chan struct{}, numWorkers)
+	var wg sync.WaitGroup
+	go func() {
+		for account := range accountsChan {
+			wg.Add(1)
+			go func(acc AdAccount) {
+				defer wg.Done()
+				defer func() { <-workerGroup }()
+				insights, err := s.FetchAdInsights(acc)
+				if err != nil {
+					log.Error().Err(err).Msgf("Failed to fetch insights for account %s", acc.Name)
+					return
+				}
+
+				out <- insights
+
+			}(account)
+		}
+		wg.Wait()
+		close(out)
+	}()
+	return out
+}
+
+func (s *FacebookService) fetchAdAccounts() (<-chan AdAccount, <-chan error) {
+	out := make(chan AdAccount)
+	errChan := make(chan error, 1)
+	go func() {
+		defer close(out)
+		accounts, err := s.GetAdAccounts()
+		if err != nil {
+			errChan <- err
+			return
+		}
+		for _, account := range accounts {
+			out <- account
+		}
+	}()
+	return out, errChan
+}
+
 func (s *FacebookService) GetAdAccounts() ([]AdAccount, error) {
 	url := fmt.Sprintf(
 		"https://graph.facebook.com/%s/me/adaccounts?fields=account_id,name,timezone_offset_hours_utc,timezone_name&access_token=%s",
@@ -55,76 +124,19 @@ func (s *FacebookService) GetAdAccounts() ([]AdAccount, error) {
 
 	return accounts, nil
 }
-
-func (s *FacebookService) FetchCreativeData() {
+func (s *FacebookService) FetchCreativeDataPipeline() {
 	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
 
 	for {
 		log.Info().Msg("Starting FetchCreativeData pipeline...")
-
-		// Define pipeline channels
-		accountsChan := make(chan AdAccount)
-		insightsChan := make(chan []AdInsight)
-		done := make(chan struct{})
-
-		// Step 1: Fetch Ad Accounts asynchronously
-		go func() {
-			defer close(accountsChan)
-			accounts, err := s.GetAdAccounts()
-			if err != nil {
-				log.Error().Err(err).Msg("Failed to fetch ad accounts")
-				return
-			}
-			for _, account := range accounts {
-				accountsChan <- account
-			}
-		}()
-
-		// Step 2: Fetch Insights concurrently using multiple workers
-		numWorkers := 5 // Number of workers fetching insights in parallel
-		go func() {
-			defer close(insightsChan)
-			workerGroup := make(chan struct{}, numWorkers)
-
-			for account := range accountsChan {
-				workerGroup <- struct{}{} // Limit concurrency
-
-				go func(acc AdAccount) {
-					defer func() { <-workerGroup }() // Release worker slot
-					
-					log.Info().Msgf("Fetching Ad Insights for Account: %s (%s)", acc.Name, acc.ID)
-					insights, err := s.FetchAdInsights(acc)
-					if err != nil {
-						log.Error().Err(err).Msgf("Failed to fetch insights for account %s", acc.Name)
-						return
-					}
-					insightsChan <- insights
-				}(account)
-			}
-
-			// Wait for all workers to finish
-			for i := 0; i < numWorkers; i++ {
-				workerGroup <- struct{}{}
-			}
-		}()
-
-		// Step 3: Process fetched insights
-		go func() {
-			defer close(done)
-			for insights := range insightsChan {
-				log.Info().Msgf("Processing %d insights...", len(insights))
-				
-			}
-		}()
-
-		<-done
-
-		log.Info().Msg("FetchCreativeData pipeline completed.")
+		if err := s.runPipeline(); err != nil {
+			log.Error().Err(err).Msg("Pipeline error")
+		}
+		log.Info().Msg("Pipeline completed.")
 		<-ticker.C
 	}
 }
-
 
 func (s *FacebookService) FetchAdInsights(account AdAccount) ([]AdInsight, error) {
 	adAccountId := account.ID
@@ -161,12 +173,12 @@ func (s *FacebookService) createAdInsightsJob(adAccountId string) (string, error
 		s.APIVersion, adAccountId, s.AccessToken)
 
 	data := map[string]string{
-		"level":                         "ad",
-		"limit":                         "300",
-		"fields":                        "ad_id,account_name,outbound_clicks,spend,cost_per_inline_link_click,cost_per_unique_outbound_click,cost_per_unique_inline_link_click,cost_per_unique_click,campaign_id,adset_id,impressions,actions,ad_name",
+		"level":                           "ad",
+		"limit":                           "300",
+		"fields":                          "ad_id,account_name,outbound_clicks,spend,cost_per_inline_link_click,cost_per_unique_outbound_click,cost_per_unique_inline_link_click,cost_per_unique_click,campaign_id,adset_id,impressions,actions,ad_name",
 		"use_unified_attribution_setting": "true",
-		"date_preset":                   "yesterday",
-		"breakdowns":                     "hourly_stats_aggregated_by_advertiser_time_zone",
+		"date_preset":                     "yesterday",
+		"breakdowns":                      "hourly_stats_aggregated_by_advertiser_time_zone",
 	}
 
 	responseData, err := utils.PostRequest(url, data)
@@ -224,8 +236,8 @@ func (s *FacebookService) fetchAdInsightsResults(jobID string) ([]AdInsight, err
 	url := fmt.Sprintf("https://graph.facebook.com/%s/%s/insights?access_token=%s",
 		s.APIVersion, jobID, s.AccessToken)
 
-		 responseData, err := utils.PaginateRequest(url)
-		// responseData, err := utils.PaginateRequestWorkerPool(url)
+	responseData, err := utils.PaginateRequest(url)
+	// responseData, err := utils.PaginateRequestWorkerPool(url)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to fetch ad insights results")
 		return nil, err
@@ -241,28 +253,27 @@ func (s *FacebookService) fetchAdInsightsResults(jobID string) ([]AdInsight, err
 }
 
 type AdInsight struct {
-	AdID                      string           `json:"ad_id"`
-	AccountName               string           `json:"account_name"`
-	OutboundClicks            []ActionMetric   `json:"outbound_clicks,omitempty"`
-	Spend                     string           `json:"spend"`
-	CostPerInlineLinkClick    string           `json:"cost_per_inline_link_click,omitempty"`
-	CostPerUniqueOutboundClick string           `json:"cost_per_unique_outbound_click,omitempty"`
-	CostPerUniqueInlineLinkClick string        `json:"cost_per_unique_inline_link_click,omitempty"`
-	CostPerUniqueClick        string           `json:"cost_per_unique_click,omitempty"`
-	CampaignID                string           `json:"campaign_id"`
-	AdsetID                   string           `json:"adset_id"`
-	Impressions               string           `json:"impressions"` // Facebook returns it as a string
-	Actions                   []ActionMetric   `json:"actions,omitempty"`
-	AdName                    string           `json:"ad_name"`
-	DateStart                 string           `json:"date_start"`
-	DateStop                  string           `json:"date_stop"`
-	HourlyStats               string           `json:"hourly_stats_aggregated_by_advertiser_time_zone"`
-	AccountID                 string           `json:"account_id"`
-		TimezoneOffsetHoursUTC   int    `json:"timezone_offset_hours_utc"`
+	AdID                         string         `json:"ad_id"`
+	AccountName                  string         `json:"account_name"`
+	OutboundClicks               []ActionMetric `json:"outbound_clicks,omitempty"`
+	Spend                        string         `json:"spend"`
+	CostPerInlineLinkClick       string         `json:"cost_per_inline_link_click,omitempty"`
+	CostPerUniqueOutboundClick   string         `json:"cost_per_unique_outbound_click,omitempty"`
+	CostPerUniqueInlineLinkClick string         `json:"cost_per_unique_inline_link_click,omitempty"`
+	CostPerUniqueClick           string         `json:"cost_per_unique_click,omitempty"`
+	CampaignID                   string         `json:"campaign_id"`
+	AdsetID                      string         `json:"adset_id"`
+	Impressions                  string         `json:"impressions"` // Facebook returns it as a string
+	Actions                      []ActionMetric `json:"actions,omitempty"`
+	AdName                       string         `json:"ad_name"`
+	DateStart                    string         `json:"date_start"`
+	DateStop                     string         `json:"date_stop"`
+	HourlyStats                  string         `json:"hourly_stats_aggregated_by_advertiser_time_zone"`
+	AccountID                    string         `json:"account_id"`
+	TimezoneOffsetHoursUTC       int            `json:"timezone_offset_hours_utc"`
 }
 
 type ActionMetric struct {
 	ActionType string `json:"action_type"`
 	Value      string `json:"value"`
 }
-
